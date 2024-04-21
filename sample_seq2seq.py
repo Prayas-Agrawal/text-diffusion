@@ -39,7 +39,7 @@ def create_argparser():
 
 @th.no_grad()
 def main():
-    MODE = "NAR"
+    MODE = "ForcedAR"
     NAR_WINDOW_SIZE = 1 # Force NAR per generated token
     args = create_argparser().parse_args()
 
@@ -208,7 +208,7 @@ def main():
             # tokenizer = load_tokenizer(args)
             pos = 0
             for seq, input_mask in zip(cands.indices, input_ids_mask_ori):
-                if(pos == NAR_WINDOW_SIZE and MODE == "NAR"): break
+                if(pos == NAR_WINDOW_SIZE and MODE == "ForcedAR"): break
                 len_x = args.seq_len - sum(input_mask).tolist()
                 tokens = tokenizer.decode_token(seq[len_x:])
                 word_lst_recover.append(tokens)
@@ -220,7 +220,7 @@ def main():
                 word_lst_source.append(tokenizer.decode_token(seq[:len_x]))
                 word_lst_ref.append(tokenizer.decode_token(seq[len_x:]))
 
-            if(MODE == "NAR"):
+            if(MODE == "ForcedAR"):
                 # word_lst_recover = [word_lst_recover[0]]
                 new_full_sent = word_lst_source.extend(word_lst_recover).join("")
                 new_tokens_batch = helper_tokenize(sentence_lst=new_full_sent, seq_len=seq_len, vocab_dict=tokenizer)
