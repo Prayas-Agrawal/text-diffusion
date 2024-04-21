@@ -12,7 +12,7 @@ import torch as th
 import torch.distributed as dist
 from transformers import set_seed
 from diffuseq.rounding import denoised_fn_round
-from diffuseq.text_datasets import load_data_text
+from diffuseq.text_datasets import TextDataset, helper_tokenize, load_data_text
 
 # from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
@@ -39,6 +39,8 @@ def create_argparser():
 
 @th.no_grad()
 def main():
+    MODE = "NAR"
+    NAR_WINDOW_SIZE = 1 # Force NAR per generated token
     args = create_argparser().parse_args()
 
     dist_util.setup_dist()
@@ -142,14 +144,7 @@ def main():
                 dist.barrier()
             continue
 
-        input_ids_x = cond.pop('input_ids').to(dist_util.dev())
-        x_start = model.get_embeds(input_ids_x)
-        input_ids_mask = cond.pop('input_mask')
-        input_ids_mask_ori = input_ids_mask
-
-        noise = th.randn_like(x_start)
-        input_ids_mask = th.broadcast_to(input_ids_mask.unsqueeze(dim=-1), x_start.shape).to(dist_util.dev())
-        x_noised = th.where(input_ids_mask == 0, x_start, noise)
+        
 
         model_kwargs = {}
 
@@ -164,49 +159,81 @@ def main():
             diffusion.p_sample_loop if not args.use_ddim else diffusion.ddim_sample_loop
         )
 
-        sample_shape = (x_start.shape[0], args.seq_len, args.hidden_dim)
-
-        samples = sample_fn(
-            model,
-            sample_shape,
-            noise=x_noised,
-            clip_denoised=args.clip_denoised,
-            denoised_fn=partial(denoised_fn_round, args, model_emb),
-            model_kwargs=model_kwargs,
-            top_p=args.top_p,
-            clamp_step=args.clamp_step,
-            clamp_first=True,
-            mask=input_ids_mask,
-            x_start=x_start,
-            gap=step_gap
-        )
-
-        # print(samples[0].shape) # samples for each step
-
-        sample = samples[-1]
-
-        # print('decoding for seq2seq', )
-        # print(sample.shape)
-
-        logits = model.get_logits(sample)  # bsz, seqlen, vocab
-        cands = th.topk(logits, k=1, dim=-1)
-
+        seq_len = args.seq_len
         word_lst_recover = []
         word_lst_ref = []
         word_lst_source = []
 
-        # tokenizer = load_tokenizer(args)
+        
+        input_ids_x = cond.pop('input_ids')
+        orig_input_ids_x = input_ids_x.detach().clone()
+        orig_sents = tokenizer.decode_token(orig_input_ids_x)
+        input_ids_x = input_ids_x.to(dist_util.dev())
+        input_ids_mask = cond.pop('input_mask')
+        for i in tqdm(range(seq_len)):
+            x_start = model.get_embeds(input_ids_x)
+            
+            input_ids_mask_ori = input_ids_mask
 
-        for seq, input_mask in zip(cands.indices, input_ids_mask_ori):
-            len_x = args.seq_len - sum(input_mask).tolist()
-            tokens = tokenizer.decode_token(seq[len_x:])
-            word_lst_recover.append(tokens)
+            noise = th.randn_like(x_start)
+            input_ids_mask = th.broadcast_to(input_ids_mask.unsqueeze(dim=-1), x_start.shape).to(dist_util.dev())
+            x_noised = th.where(input_ids_mask == 0, x_start, noise)
+            sample_shape = (x_start.shape[0], seq_len, args.hidden_dim)
 
-        for seq, input_mask in zip(input_ids_x, input_ids_mask_ori):
-            # tokens = tokenizer.decode_token(seq)
-            len_x = args.seq_len - sum(input_mask).tolist()
-            word_lst_source.append(tokenizer.decode_token(seq[:len_x]))
-            word_lst_ref.append(tokenizer.decode_token(seq[len_x:]))
+            samples = sample_fn(
+                model,
+                sample_shape,
+                noise=x_noised,
+                clip_denoised=args.clip_denoised,
+                denoised_fn=partial(denoised_fn_round, args, model_emb),
+                model_kwargs=model_kwargs,
+                top_p=args.top_p,
+                clamp_step=args.clamp_step,
+                clamp_first=True,
+                mask=input_ids_mask,
+                x_start=x_start,
+                gap=step_gap
+            )
+
+            # print(samples[0].shape) # samples for each step
+
+            sample = samples[-1]
+
+            # print('decoding for seq2seq', )
+            # print(sample.shape)
+
+            logits = model.get_logits(sample)  # bsz, seqlen, vocab
+            cands = th.topk(logits, k=1, dim=-1)
+
+            # tokenizer = load_tokenizer(args)
+            pos = 0
+            for seq, input_mask in zip(cands.indices, input_ids_mask_ori):
+                if(pos == NAR_WINDOW_SIZE and MODE == "NAR"): break
+                len_x = args.seq_len - sum(input_mask).tolist()
+                tokens = tokenizer.decode_token(seq[len_x:])
+                word_lst_recover.append(tokens)
+                pos += 1
+
+            for seq, input_mask in zip(input_ids_x, input_ids_mask_ori):
+                # tokens = tokenizer.decode_token(seq)
+                len_x = args.seq_len - sum(input_mask).tolist()
+                word_lst_source.append(tokenizer.decode_token(seq[:len_x]))
+                word_lst_ref.append(tokenizer.decode_token(seq[len_x:]))
+
+            if(MODE == "NAR"):
+                # word_lst_recover = [word_lst_recover[0]]
+                new_full_sent = word_lst_source.extend(word_lst_recover).join("")
+                new_tokens_batch = helper_tokenize(sentence_lst=new_full_sent, seq_len=seq_len, vocab_dict=tokenizer)
+                with th.no_grad():
+                    input_ids = new_tokens_batch[args.split][idx]['input_ids']
+                    hidden_state = model_emb(th.tensor(input_ids))
+                    input_ids_x = np.array(new_tokens_batch[args.split][idx]['input_ids'])
+                    input_ids_mask = np.array(new_tokens_batch[args.split][idx]['input_mask'])
+
+            else:
+                break
+
+
 
         for i in range(world_size):
             if i == rank:  # Write files sequentially
