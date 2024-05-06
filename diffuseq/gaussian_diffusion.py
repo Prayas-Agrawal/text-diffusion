@@ -18,6 +18,33 @@ import torch.nn.functional as F
 from .utils.nn import mean_flat
 from .utils.losses import normal_kl, discretized_gaussian_log_likelihood
 
+
+NOISE = "Adaptive"
+class ModelMeanType(enum.Enum):
+    """
+    Which type of output the model predicts.
+    """
+
+    PREVIOUS_X = enum.auto()  # the model predicts x_{t-1}
+    START_X = enum.auto()  # the model predicts x_0
+    EPSILON = enum.auto()  # the model predicts epsilon
+
+
+class ModelVarType(enum.Enum):
+    """
+    What is used as the model's output variance.
+
+    The LEARNED_RANGE option has been added to allow the model to predict
+    values between FIXED_SMALL and FIXED_LARGE, making its job easier.
+    """
+
+    LEARNED = enum.auto()
+    FIXED_SMALL = enum.auto()
+    FIXED_LARGE = enum.auto()
+    LEARNED_RANGE = enum.auto()
+
+
+
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
     """
     Get a pre-defined beta schedule for the given name.
@@ -193,6 +220,8 @@ class GaussianDiffusion:
 
     def training_losses(self, model, *args, **kwargs):
         self.model = model
+        if(NOISE == "Adaptive"):
+            return self.training_losses_adaptive(model, *args, **kwargs)
         return self.training_losses_seq2seq(model, *args, **kwargs)
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
@@ -445,6 +474,7 @@ class GaussianDiffusion:
         :return: a non-differentiable batch of samples.
         """
         final = []
+        
         for sample in self.p_sample_loop_progressive(
             model,
             shape,
@@ -634,6 +664,78 @@ class GaussianDiffusion:
         # assert (model.lm_head.weight == model.word_embedding.weight).all()
 
         terms["loss"] = terms["mse"] + decoder_nll + tT_loss
+
+        return terms
+
+    #OURS
+    def training_losses_adaptive(self, model, x_start, t, model_kwargs=None, noise=None):
+        assert "input_ids" in model_kwargs
+        assert "decoder_input_ids" in model_kwargs
+        input_ids = model_kwargs.pop("decoder_input_ids").to(t.device)
+        if 'loss_mask' in model_kwargs:
+            loss_mask = model_kwargs.pop('loss_mask').to(t.device)
+        else:
+            loss_mask = None
+        x_start_mean = model.model.module.get_embeds(input_ids)
+
+        std = _extract_into_tensor(
+            self.sqrt_one_minus_alphas_cumprod,
+            th.tensor([0]).to(x_start_mean.device),
+            x_start_mean.shape,
+        )
+        x_start = self.get_x_start(x_start_mean, std)
+
+        if noise is None:
+            noise = th.randn_like(x_start)
+        x_t = self.q_sample(x_start, t, noise=noise)  # reparametrization trick.
+
+        get_logits = model.model.module.get_logits
+
+        ### self-conditioning part
+        model_kwargs['self_conditions'] = th.zeros_like(x_t)
+        if np.random.uniform() > 0.5:
+            with th.no_grad():
+                model_output = model(x = x_t, ts = self._scale_timesteps(t), **model_kwargs)
+            model_kwargs['self_conditions'] = model_output.detach()
+                        
+        model_output = model(x = x_t, ts = self._scale_timesteps(t), **model_kwargs)
+
+        target = {
+            ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(x_start=x_start, x_t=x_t, t=t)[
+                0
+            ],
+            ModelMeanType.START_X: x_start,  # THIS is actually used
+            ModelMeanType.EPSILON: noise,
+        }[self.model_mean_type]
+
+        assert (
+            model_output.shape == target.shape == x_start.shape
+        ), f"model_output.shape: {model_output.shape}, target.shape: {target.shape}, x_start.shape: {x_start.shape}"
+        # the usual diffusion loss
+        terms = {}
+        terms["mse"] = mean_flat((target - model_output) ** 2, loss_mask)
+        model_out_x_start = self.x0_helper(model_output, x_t, t)["pred_xstart"]
+        t0_mask = t == 0
+        t0_loss = mean_flat((x_start_mean - model_out_x_start) ** 2, loss_mask)
+        terms["mse"] = th.where(t0_mask, t0_loss, terms["mse"])
+
+        ### adaptive noise schedule logging part
+        with th.no_grad():
+            mse_loss_log_ = th.mean((target - model_output) ** 2, dim = -1).detach()
+            t0_loss_log_ = th.mean((x_start_mean - model_out_x_start) ** 2, dim = -1).detach()
+            _loss_log = mse_loss_log_
+            _loss_log[t0_mask] = t0_loss_log_[t0_mask]
+            _loss_log[input_ids==self.pad_tok_id] = 0
+            self._loss_history_update(t, _loss_log, input_ids!=self.pad_tok_id, x_start)
+
+        out_mean, _, _ = self.q_mean_variance(
+            x_start, th.LongTensor([self.num_timesteps - 1]).to(x_start.device)
+        )
+        tT_loss = mean_flat(out_mean**2)
+        
+        decoder_nll = self.token_discrete_loss(x_start, get_logits, input_ids, mask=loss_mask)
+
+        terms["loss"] = terms["mse"] + (decoder_nll + tT_loss)
 
         return terms
 

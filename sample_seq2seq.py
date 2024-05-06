@@ -36,7 +36,6 @@ def create_argparser():
     add_dict_to_argparser(parser, defaults)
     return parser
 
-
 @th.no_grad()
 def main():
     MODE = "ForcedAR"
@@ -155,9 +154,7 @@ def main():
             args.use_ddim = True
             step_gap = args.diffusion_steps//args.step
 
-        sample_fn = (
-            diffusion.p_sample_loop if not args.use_ddim else diffusion.ddim_sample_loop
-        )
+        sample_fn = diffusion.p_sample_loop
 
         seq_len = args.seq_len
         word_lst_recover = []
@@ -170,6 +167,7 @@ def main():
         orig_sents = tokenizer.decode_token(orig_input_ids_x)
         input_ids_x = input_ids_x.to(dist_util.dev())
         input_ids_mask = cond.pop('input_mask')
+        #OURS
         for i in tqdm(range(seq_len)):
             x_start = model.get_embeds(input_ids_x)
             
@@ -207,6 +205,7 @@ def main():
 
             # tokenizer = load_tokenizer(args)
             pos = 0
+            #OURS
             for seq, input_mask in zip(cands.indices, input_ids_mask_ori):
                 if(pos == NAR_WINDOW_SIZE and MODE == "ForcedAR"): break
                 len_x = args.seq_len - sum(input_mask).tolist()
@@ -220,6 +219,7 @@ def main():
                 word_lst_source.append(tokenizer.decode_token(seq[:len_x]))
                 word_lst_ref.append(tokenizer.decode_token(seq[len_x:]))
 
+            #OURS
             if(MODE == "ForcedAR"):
                 # word_lst_recover = [word_lst_recover[0]]
                 new_full_sent = word_lst_source.extend(word_lst_recover).join("")
