@@ -669,8 +669,6 @@ class GaussianDiffusion:
 
     #OURS
     def training_losses_adaptive(self, model, x_start, t, model_kwargs=None, noise=None):
-        assert "input_ids" in model_kwargs
-        assert "decoder_input_ids" in model_kwargs
         input_ids = model_kwargs.pop("decoder_input_ids").to(t.device)
         if 'loss_mask' in model_kwargs:
             loss_mask = model_kwargs.pop('loss_mask').to(t.device)
@@ -699,18 +697,7 @@ class GaussianDiffusion:
             model_kwargs['self_conditions'] = model_output.detach()
                         
         model_output = model(x = x_t, ts = self._scale_timesteps(t), **model_kwargs)
-
-        target = {
-            ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(x_start=x_start, x_t=x_t, t=t)[
-                0
-            ],
-            ModelMeanType.START_X: x_start,  # THIS is actually used
-            ModelMeanType.EPSILON: noise,
-        }[self.model_mean_type]
-
-        assert (
-            model_output.shape == target.shape == x_start.shape
-        ), f"model_output.shape: {model_output.shape}, target.shape: {target.shape}, x_start.shape: {x_start.shape}"
+        target = x_start
         # the usual diffusion loss
         terms = {}
         terms["mse"] = mean_flat((target - model_output) ** 2, loss_mask)
